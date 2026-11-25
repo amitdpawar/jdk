@@ -363,6 +363,11 @@ void MutableNUMASpace::initialize(MemRegion mr,
                       current_chunk_size(0) > page_size()                &&
                       current_chunk_size(lgrp_spaces()->length() - 1) > page_size();
 
+  // Initial eden setup: pretouch the whole eden with one PretouchTask after
+  // all nodes are bound. Resizes keep the per-node PretouchTask calls.
+  const bool use_single_pretouch = AlwaysPreTouch &&
+                                   pretouch_workers != nullptr &&
+                                   old_region.is_empty();
 
   for (int i = 0; i < lgrp_spaces()->length(); i++) {
     LGRPSpace *ls = lgrp_spaces()->at(i);
@@ -431,7 +436,7 @@ void MutableNUMASpace::initialize(MemRegion mr,
     bias_region(bottom_region, ls->lgrp_id());
     bias_region(top_region, ls->lgrp_id());
 
-    if (AlwaysPreTouch) {
+    if (AlwaysPreTouch && !use_single_pretouch) {
       PretouchTask::pretouch("ParallelGC PreTouch bottom_region", (char*)bottom_region.start(), (char*)bottom_region.end(),
                              page_size(), pretouch_workers);
 
@@ -441,6 +446,11 @@ void MutableNUMASpace::initialize(MemRegion mr,
 
     // Clear space (set top = bottom) but never mangle.
     s->initialize(new_region, SpaceDecorator::Clear, SpaceDecorator::DontMangle, MutableSpace::DontSetupPages);
+  }
+
+  if (use_single_pretouch) {
+    PretouchTask::pretouch("ParallelGC PreTouch eden", (char*)mr.start(), (char*)mr.end(),
+                           page_size(), pretouch_workers);
   }
   set_adaptation_cycles(samples_count());
 }
