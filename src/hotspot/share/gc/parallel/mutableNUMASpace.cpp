@@ -304,6 +304,38 @@ void MutableNUMASpace::select_tails(MemRegion new_region, MemRegion intersection
   }
 }
 
+// Pretouch all node ranges at the same time. Worker w starts on range w % N and,
+// once that range is exhausted, continues with the following ranges in order.
+class PSNodeSplitPretouchTask : public WorkerTask {
+  GrowableArray<PretouchTask*> _tasks;
+
+public:
+  PSNodeSplitPretouchTask(const GrowableArray<MemRegion>* ranges, size_t page_size) :
+      WorkerTask("ParallelGC NUMA Split PreTouch"),
+      _tasks(ranges->length(), mtGC) {
+    const size_t chunk_size = align_down_bounded(PretouchTask::chunk_size(), page_size);
+    for (int i = 0; i < ranges->length(); i++) {
+      const MemRegion r = ranges->at(i);
+      _tasks.append(new PretouchTask("ParallelGC NUMA Split PreTouch range",
+                                     (char*)r.start(), (char*)r.end(), page_size, chunk_size));
+    }
+  }
+
+  ~PSNodeSplitPretouchTask() {
+    for (int i = 0; i < _tasks.length(); i++) {
+      delete _tasks.at(i);
+    }
+  }
+
+  void work(uint worker_id) override {
+    const int n = _tasks.length();
+    for (int k = 0; k < n; k++) {
+      // An exhausted range returns immediately.
+      _tasks.at((int)((worker_id + k) % (uint)n))->work(worker_id);
+    }
+  }
+};
+
 void MutableNUMASpace::initialize(MemRegion mr,
                                   bool clear_space,
                                   bool mangle_space,
@@ -363,6 +395,12 @@ void MutableNUMASpace::initialize(MemRegion mr,
                       current_chunk_size(0) > page_size()                &&
                       current_chunk_size(lgrp_spaces()->length() - 1) > page_size();
 
+  // Initial eden setup: pretouch all node ranges concurrently after binding.
+  // Resizes keep the per-node PretouchTask calls.
+  const bool use_split_pretouch = AlwaysPreTouch &&
+                                  pretouch_workers != nullptr &&
+                                  old_region.is_empty();
+  GrowableArray<MemRegion> pretouch_ranges(lgrp_spaces()->length(), mtGC);
 
   for (int i = 0; i < lgrp_spaces()->length(); i++) {
     LGRPSpace *ls = lgrp_spaces()->at(i);
@@ -431,7 +469,14 @@ void MutableNUMASpace::initialize(MemRegion mr,
     bias_region(bottom_region, ls->lgrp_id());
     bias_region(top_region, ls->lgrp_id());
 
-    if (AlwaysPreTouch) {
+    if (use_split_pretouch) {
+      if (!bottom_region.is_empty()) {
+        pretouch_ranges.append(bottom_region);
+      }
+      if (!top_region.is_empty()) {
+        pretouch_ranges.append(top_region);
+      }
+    } else if (AlwaysPreTouch) {
       PretouchTask::pretouch("ParallelGC PreTouch bottom_region", (char*)bottom_region.start(), (char*)bottom_region.end(),
                              page_size(), pretouch_workers);
 
@@ -441,6 +486,19 @@ void MutableNUMASpace::initialize(MemRegion mr,
 
     // Clear space (set top = bottom) but never mangle.
     s->initialize(new_region, SpaceDecorator::Clear, SpaceDecorator::DontMangle, MutableSpace::DontSetupPages);
+  }
+
+  if (use_split_pretouch && !pretouch_ranges.is_empty()) {
+    const size_t chunk_size = align_down_bounded(PretouchTask::chunk_size(), page_size());
+    size_t total_chunks = 0;
+    for (int i = 0; i < pretouch_ranges.length(); i++) {
+      total_chunks += (pretouch_ranges.at(i).byte_size() - 1) / chunk_size + 1;
+    }
+    const uint num_workers = (uint)MIN2(total_chunks, (size_t)pretouch_workers->max_workers());
+    PSNodeSplitPretouchTask task(&pretouch_ranges, page_size());
+    log_debug(gc, heap)("Running %s with %u workers for %d node ranges.",
+                        task.name(), num_workers, pretouch_ranges.length());
+    pretouch_workers->run_task(&task, num_workers);
   }
   set_adaptation_cycles(samples_count());
 }
